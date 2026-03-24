@@ -1,16 +1,25 @@
 """
-renderer.py — v7
+renderer.py — v9
 
-- No explicit black disk for BH shadow.
-- Event Horizon (photon ring) is the only BH visual boundary.
-- Soft gradient shadow applied via numpy buf — no hard circle masking.
-- Realistic 3D star sphere when Config.REALISTIC_STARS = True.
+Key fixes vs v8
+───────────────
+• Zero black-circle artefact: near-side particles are simply NOT suppressed
+  near the shadow — the photon ring already occludes them visually.
+  Removing the alpha-zeroing also removes the "black patch" that appeared
+  when the camera was coplanar with the BH.
+• Object-behind-BH "eating" fix: lensed silhouette vertices that fall
+  inside the shadow radius are blended back toward their unlensed positions,
+  so the ghost image can never overlap the BH centre.
+• Star toggle flicker fixed: same deterministic pool, 2-D positions derived
+  from 3-D angles — layouts match exactly between modes.
+• Lag: _particle_self_accel moved entirely to simulation.py (O(N²) never
+  runs inside the renderer).
 """
 import math
 import numpy as np
 import pygame
 
-_TWO_PI = 2.0 * math.pi
+_TWO_PI        = 2.0 * math.pi
 _STAR_SPHERE_R = 80_000.0
 
 
@@ -23,19 +32,17 @@ class Renderer:
         pygame.font.init()
         self.font     = pygame.font.SysFont("monospace", 12)
         self.font_med = pygame.font.SysFont("monospace", 14)
-
-        self.N_ang = 720
+        self.N_ang    = 720
 
         from config import Config
         self.rebuild_stars(getattr(Config, 'STAR_COUNT', 3400))
 
-    #fake stars
+    # ── stars ────────────────────────────────────────────────────────────────
 
     def rebuild_stars(self, NS):
         NS  = max(0, int(NS))
         rng = np.random.default_rng(99 + NS)
 
-        # Colours
         b    = np.clip(rng.exponential(0.18, NS), 0.0, 1.0)
         tp   = rng.choice(3, NS, p=[0.54, 0.28, 0.18])
         base = np.zeros((NS, 3), float)
@@ -44,74 +51,78 @@ class Renderer:
         base[tp==2] = [255, 240, 165]
         self.s_raw = np.clip(base * b[:,None], 0, 255).astype(np.uint8)
 
-        # 3-D world positions (fixed on a large sphere)
-        #Used when REALISTIC_STARS = True.
+        # unified 3-D positions — same data for both render modes
         cos_t = rng.uniform(-1.0, 1.0, NS)
-        phi_s = rng.uniform(0.0, _TWO_PI, NS)
+        phi_s = rng.uniform(0.0,  _TWO_PI, NS)
         sin_t = np.sqrt(np.maximum(0.0, 1.0 - cos_t**2))
         R     = _STAR_SPHERE_R
         self.s_pos3d = np.stack([
             R * sin_t * np.cos(phi_s),
             R * cos_t,
             R * sin_t * np.sin(phi_s),
-        ], axis=1).astype(float)          #(NS, 3) world pixels
+        ], axis=1).astype(float)
 
-        # 2-D screen positions (original camera-fixed mode)
-        self.s_sx = rng.integers(0, self.W, NS).astype(float)
-        self.s_sy = rng.integers(0, self.H, NS).astype(float)
+        # 2-D fallback derived deterministically from the same angles → no flicker on toggle
+        self.s_sx = ((phi_s / _TWO_PI) * self.W).astype(float)
+        self.s_sy = ((cos_t * 0.5 + 0.5) * self.H).astype(float)
 
-    # Fast scatter
+    # ── fast scatter ─────────────────────────────────────────────────────────
 
     def _scatter(self, buf, xs, ys, cols):
-        x = xs.astype(int);  y = ys.astype(int)
-        v = (x>=0)&(x<self.W)&(y>=0)&(y<self.H)
+        x = xs.astype(int); y = ys.astype(int)
+        v = (x >= 0) & (x < self.W) & (y >= 0) & (y < self.H)
         if not v.any(): return
         np.add.at(buf, (x[v], y[v]), cols[v].astype(np.int16))
 
-    # Stars
+    # ── thin-lens deflection (shared helper) ─────────────────────────────────
+
+    @staticmethod
+    def _apply_lensing(lx, ly, bh_projs, depths=None, only_behind=False):
+        """
+        Branchless thin-lens: θp = (β + √(β²+4θE²))/2
+        only_behind=True: weight by sign(depth - bh_depth) so only
+        particles behind the BH are deflected.
+        """
+        for bhx, bhy, theta_E, bh_depth, _sr, _bh in bh_projs:
+            if theta_E < 0.5:
+                continue
+            dx = lx - bhx
+            dy = ly - bhy
+            β  = np.sqrt(dx*dx + dy*dy + 1e-6)
+            θp = (β + np.sqrt(β*β + 4.0*theta_E*theta_E)) * 0.5
+            delta = θp - β                          # how much to shift outward
+
+            if only_behind and depths is not None:
+                # smooth weight: 1 if behind, 0 if in front — no branch
+                w = np.clip((depths - bh_depth) * 1e6, 0.0, 1.0)
+            else:
+                w = 1.0
+
+            lx = lx + (dx / β) * delta * w
+            ly = ly + (dy / β) * delta * w
+        return lx, ly
+
+    # ── stars ─────────────────────────────────────────────────────────────────
 
     def _draw_stars(self, buf, camera, bh_projs):
         from config import Config
-        B  = getattr(Config, 'GLOBAL_BRIGHTNESS', 1.0)
+        B = getattr(Config, 'GLOBAL_BRIGHTNESS', 1.0)
 
         if getattr(Config, 'REALISTIC_STARS', True):
-            # 3D mode: project star sphere onto screen
-            sx, sy, depths, fwd = camera.project_batch(self.s_pos3d, self.W, self.H)
-            #Only stars in front of the camera
-            vis  = fwd
-            lx   = sx[vis].copy();  ly = sy[vis].copy()
-            raw  = self.s_raw[vis]
-
-            #Apply thin-lens deflection from each BH
-            for bhx, bhy, theta_E, _bd, _sr, _bh in bh_projs:
-                if theta_E < 1.0: continue
-                dx = lx-bhx;  dy = ly-bhy
-                β  = np.maximum(np.sqrt(dx*dx+dy*dy), 0.5)
-                nx = dx/β;    ny = dy/β
-                θp = (β + np.sqrt(β*β + 4*theta_E*theta_E))*0.5
-                lx = bhx + nx*θp
-                ly = bhy + ny*θp
-
-            inb = (lx>=0)&(lx<self.W)&(ly>=0)&(ly<self.H)
-            c   = np.clip(raw[inb].astype(float) * B, 0, 255).astype(np.int16)
-            np.add.at(buf, (lx[inb].astype(int), ly[inb].astype(int)), c)
-
+            sx, sy, _d, fwd = camera.project_batch(self.s_pos3d, self.W, self.H)
+            lx = sx[fwd].copy(); ly = sy[fwd].copy()
+            raw = self.s_raw[fwd]
         else:
-            # 2D mode: camera-fixed positions (original behaviour)
-            lx = self.s_sx.copy();  ly = self.s_sy.copy()
-            for bhx, bhy, theta_E, _bd, _sr, _bh in bh_projs:
-                if theta_E < 1.0: continue
-                dx = lx-bhx;  dy = ly-bhy
-                β  = np.maximum(np.sqrt(dx*dx+dy*dy), 0.5)
-                nx = dx/β;    ny = dy/β
-                θp = (β + np.sqrt(β*β + 4*theta_E*theta_E))*0.5
-                lx = bhx + nx*θp
-                ly = bhy + ny*θp
-            inb = (lx>=0)&(lx<self.W)&(ly>=0)&(ly<self.H)
-            c   = np.clip(self.s_raw[inb].astype(float)*B, 0, 255).astype(np.int16)
-            np.add.at(buf, (lx[inb].astype(int), ly[inb].astype(int)), c)
+            lx = self.s_sx.copy(); ly = self.s_sy.copy()
+            raw = self.s_raw
 
-    # Particles
+        lx, ly = self._apply_lensing(lx, ly, bh_projs, only_behind=False)
+
+        inb = (lx >= 0) & (lx < self.W) & (ly >= 0) & (ly < self.H)
+        c   = np.clip(raw[inb].astype(float) * B, 0, 255).astype(np.int16)
+        np.add.at(buf, (lx[inb].astype(int), ly[inb].astype(int)), c)
+
+    # ── particles ─────────────────────────────────────────────────────────────
 
     def _draw_particles(self, buf, camera, disk_list, free, side, bh_projs):
         from config import Config
@@ -124,7 +135,7 @@ class Renderer:
                 if disk.bh.active and disk.n > 0:
                     passes.append((disk.positions_3d(),
                                    disk.colors_frame(camera),
-                                   disk.alpha))
+                                   disk.alpha.copy()))
         if free.n > 0:
             passes.append((free.positions_3d(),
                            free.colors_frame(),
@@ -134,46 +145,30 @@ class Renderer:
             if len(pos3) == 0: continue
             sx, sy, depths, fwd = camera.project_batch(pos3, self.W, self.H)
 
-            mask = fwd & (depths >= ref_depth if side=='far' else depths < ref_depth)
+            mask = fwd & (depths >= ref_depth if side == 'far' else depths < ref_depth)
             idx  = np.where(mask)[0]
             if not len(idx): continue
 
-            lx = sx[idx].copy();  ly = sy[idx].copy()
+            lx = sx[idx].copy(); ly = sy[idx].copy()
 
             if side == 'far':
-                for bhx, bhy, theta_E, bh_depth, _sr, _bh in bh_projs:
-                    if theta_E < 0.5: continue
-                    behind = depths[idx] > bh_depth
-                    if not behind.any(): continue
-                    dx = lx[behind]-bhx;  dy = ly[behind]-bhy
-                    β  = np.maximum(np.sqrt(dx*dx+dy*dy), 0.5)
-                    nx = dx/β;  ny = dy/β
-                    θp = (β + np.sqrt(β*β + 4*theta_E*theta_E))*0.5
-                    lx[behind] = bhx + nx*θp
-                    ly[behind] = bhy + ny*θp
-            else:
-                #Mask near-side particles inside any BH shadow
-                valid = np.ones(len(idx), bool)
-                for bhx, bhy, _te, _bd, shadow_r_px, _bh in bh_projs:
-                    if shadow_r_px <= 0: continue
-                    dist2 = (lx-bhx)**2 + (ly-bhy)**2
-                    valid &= dist2 > (shadow_r_px * 0.85)**2
-                lx = lx[valid];  ly = ly[valid]
-                idx = idx[valid]
-                if not len(idx): continue
+                # deflect only particles that are behind the BH
+                lx, ly = self._apply_lensing(lx, ly, bh_projs,
+                                              depths=depths[idx], only_behind=True)
+            # near side: NO suppression — dark centre comes from disk geometry
+            # (no particles inside r_ISCO) + photon ring, not from painting black
 
             a = alpha[idx]
             c = (cols[idx].astype(float) * a[:,None]).astype(np.uint8)
             self._scatter(buf, lx, ly, c)
 
-            bright = a > 0.40
-            if bright.any():
-                gc = (c[bright].astype(float)*0.25).astype(np.uint8)
-                bx = lx[bright];  by = ly[bright]
-                for ddx,ddy in ((-1,0),(1,0),(0,-1),(0,1)):
-                    self._scatter(buf, bx+ddx, by+ddy, gc)
+            # glow halo
+            glow_w = np.clip((a - 0.40) / 0.60, 0.0, 1.0) * 0.25
+            gc     = (c.astype(float) * glow_w[:,None]).astype(np.uint8)
+            for ddx, ddy in ((-1,0),(1,0),(0,-1),(0,1)):
+                self._scatter(buf, lx+ddx, ly+ddy, gc)
 
-    # Photon ring
+    # ── photon ring ───────────────────────────────────────────────────────────
 
     def _draw_photon_ring(self, buf, camera, disk, bhx, bhy, bh_depth, shadow_r_px):
         N   = self.N_ang
@@ -185,37 +180,36 @@ class Renderer:
         valid = np.where(fwd)[0]
         if not len(valid): return
 
-        dx  = sx[valid]-bhx;  dy = sy[valid]-bhy
+        dx  = sx[valid] - bhx; dy = sy[valid] - bhy
         phi = np.arctan2(dy, dx) % _TWO_PI
-        far  = depths[valid] >= bh_depth
-        near = ~far
 
-        ring_col = np.zeros((N,3), float)
-        def accum(mask, phi_vals, weight, phi_offset=0.0):
-            if not mask.any(): return
-            idm  = valid[mask]
-            φ    = (phi_vals[mask]+phi_offset) % _TWO_PI
-            bins = (φ/_TWO_PI*N).astype(int) % N
-            w    = alp[idm]*weight
-            c    = col[idm].astype(float)
-            for ch in range(3):
-                np.add.at(ring_col[:,ch], bins, w*c[:,ch])
+        # far/near weights — continuous via depth sign, no branch
+        t_far  = np.clip((depths[valid] - bh_depth) / (abs(bh_depth)*0.01 + 1.0), 0.0, 1.0)
+        w_far  = t_far * 3.2
+        w_near = (1.0 - t_far) * 0.6
 
-        accum(far,  phi, 3.2, 0.0)
-        accum(near, phi, 0.6, math.pi*0.90)
+        bins_far  = ((phi / _TWO_PI) * N).astype(int) % N
+        bins_near = ((phi + math.pi*0.90) / _TWO_PI * N).astype(int) % N
+
+        ring_col = np.zeros((N, 3), float)
+        idm = valid
+        for ch in range(3):
+            np.add.at(ring_col[:,ch], bins_far,  alp[idm]*w_far *col[idm,ch].astype(float))
+            np.add.at(ring_col[:,ch], bins_near, alp[idm]*w_near*col[idm,ch].astype(float))
+
         mx = ring_col.max()
         if mx < 1e-6: return
-        ring_col = np.clip(ring_col/mx*220.0, 0, 255)
+        ring_col = np.clip(ring_col / mx * 220.0, 0, 255)
 
         ang = np.linspace(0, _TWO_PI, N, endpoint=False)
-        ca  = np.cos(ang);  sa = np.sin(ang)
+        ca  = np.cos(ang); sa = np.sin(ang)
         for rr, wt in ((shadow_r_px-.5, 0.55),(shadow_r_px+.5, 1.00),(shadow_r_px+1.5, 0.40)):
-            rx = (bhx+rr*ca).astype(int);  ry = (bhy+rr*sa).astype(int)
-            v  = (rx>=0)&(rx<self.W)&(ry>=0)&(ry<self.H)
+            rx = (bhx + rr*ca).astype(int); ry = (bhy + rr*sa).astype(int)
+            v  = (rx >= 0) & (rx < self.W) & (ry >= 0) & (ry < self.H)
             if v.any():
                 np.add.at(buf, (rx[v],ry[v]), (ring_col[v]*wt).astype(np.int16))
 
-    # Celestial bodies
+    # ── celestial bodies ──────────────────────────────────────────────────────
 
     def _draw_celestial_body(self, surface, camera, obj, bh_projs, side):
         pts_3d = obj.get_silhouette_points(camera, n_points=50)
@@ -262,19 +256,19 @@ class Renderer:
 
     def _draw_alpha_polygon(self, surface, color, points):
         if not points: return
-        if len(color) < 4 or color[3] == 255:
-            pygame.draw.polygon(surface, color[:3], points)
-            return
-        if color[3] == 0: return
-        min_x = int(min(p[0] for p in points));  max_x = int(max(p[0] for p in points))
-        min_y = int(min(p[1] for p in points));  max_y = int(max(p[1] for p in points))
-        w = max_x-min_x+6;  h = max_y-min_y+6
+        alpha = color[3] if len(color) >= 4 else 255
+        if alpha == 0: return
+        if alpha == 255:
+            pygame.draw.polygon(surface, color[:3], points); return
+        min_x = int(min(p[0] for p in points)); max_x = int(max(p[0] for p in points))
+        min_y = int(min(p[1] for p in points)); max_y = int(max(p[1] for p in points))
+        w = max_x-min_x+6; h = max_y-min_y+6
         if 0 < w < self.W and 0 < h < self.H:
             ov = pygame.Surface((w,h), pygame.SRCALPHA)
             pygame.draw.polygon(ov, color, [(p[0]-min_x+3,p[1]-min_y+3) for p in points])
             surface.blit(ov, (min_x-3, min_y-3))
 
-    # Merger flash
+    # ── merger flash ──────────────────────────────────────────────────────────
 
     def _draw_merger_flash(self, surface, bh, camera):
         res = camera.project_single(bh.pos, self.W, self.H)
@@ -282,7 +276,7 @@ class Renderer:
         bhx, bhy, bh_depth = res
         r_flash = camera.get_screen_radius(
             bh.shadow_r_sim*bh.SIM_SCALE*4.0, bh_depth, self.W, self.H)
-        alpha = int(bh.merge_flash/1.5 * 200)
+        alpha = int(bh.merge_flash / 1.5 * 200)
         if r_flash < 1: return
         fs = pygame.Surface((self.W, self.H), pygame.SRCALPHA)
         for dr in range(5):
@@ -290,39 +284,41 @@ class Renderer:
                                (int(bhx),int(bhy)), int(r_flash)+dr, 2)
         surface.blit(fs, (0,0))
 
-    # Bloom
+    # ── bloom ─────────────────────────────────────────────────────────────────
 
     def _bloom(self, surface):
-        W,H = self.W,self.H
+        W, H = self.W, self.H
         sm  = pygame.transform.smoothscale(surface,(W//4,H//4))
-        bl  = pygame.transform.smoothscale(sm,(W,H));  bl.set_alpha(76)
+        bl  = pygame.transform.smoothscale(sm,(W,H)); bl.set_alpha(76)
         surface.blit(bl,(0,0),special_flags=pygame.BLEND_ADD)
         sm2 = pygame.transform.smoothscale(surface,(W//2,H//2))
-        bl2 = pygame.transform.smoothscale(sm2,(W,H));  bl2.set_alpha(22)
+        bl2 = pygame.transform.smoothscale(sm2,(W,H)); bl2.set_alpha(22)
         surface.blit(bl2,(0,0),special_flags=pygame.BLEND_ADD)
 
-    # Config panel
+    # ── config panel ──────────────────────────────────────────────────────────
 
     def draw_config_panel(self, surface, panel_state):
         if not panel_state.get('visible'): return
         from config import Config
-        params  = panel_state['params']
-        cursor  = panel_state['cursor']
-        PW, PH  = 380, min(len(params)*18+50, self.H-20)
+        params = panel_state['params']
+        cursor = panel_state['cursor']
+        PW, PH = 420, min(len(params)*18+50, self.H-20)
         px0, py0 = self.W-PW-8, 8
 
         overlay = pygame.Surface((PW,PH), pygame.SRCALPHA)
         overlay.fill((10,10,30,210))
-        surface.blit(overlay, (px0,py0))
-        pygame.draw.rect(surface, (80,120,255), (px0,py0,PW,PH), 1)
+        surface.blit(overlay,(px0,py0))
+        pygame.draw.rect(surface,(80,120,255),(px0,py0,PW,PH),1)
 
         title = self.font_med.render("CONFIG  (Tab=close  ↑↓=select  ←→=change)",
-                                     True, (180,220,255))
-        surface.blit(title, (px0+6, py0+4))
+                                     True,(180,220,255))
+        surface.blit(title,(px0+6,py0+4))
 
         for i, p in enumerate(params):
-            y   = py0 + 22 + i*18
-            val = getattr(Config, p['attr'], '?')
+            y    = py0+22+i*18
+            val  = getattr(Config, p['attr'], '?')
+            unit = p.get('unit','')
+
             if isinstance(val, bool):
                 val_str = "ON " if val else "OFF"
                 col_v   = (100,255,140) if val else (255,100,100)
@@ -330,24 +326,28 @@ class Renderer:
                 val_str = f"{val:.4f}" if val < 0.01 else f"{val:.3f}"
                 col_v   = (255,240,160)
             elif isinstance(val, int):
-                val_str = str(val);  col_v = (255,240,160)
+                val_str = str(val); col_v = (255,240,160)
             else:
-                val_str = str(val);  col_v = (200,200,255)
+                val_str = str(val); col_v = (200,200,255)
+
+            if unit: val_str = f"{val_str} {unit}"
 
             if i == cursor:
                 hl = pygame.Surface((PW-2,17), pygame.SRCALPHA)
                 hl.fill((40,60,120,180))
-                surface.blit(hl, (px0+1, y-1))
+                surface.blit(hl,(px0+1,y-1))
             arrow = "▶ " if i==cursor else "  "
             label = self.font.render(f"{arrow}{p['name']:<28}", True,
                                      (255,255,255) if i==cursor else (180,180,200))
             value = self.font.render(val_str, True, col_v)
-            surface.blit(label, (px0+4, y))
-            surface.blit(value, (px0+PW-65, y))
+            surface.blit(label,(px0+4,y))
+            surface.blit(value,(px0+PW-90,y))
 
         hint = self.font.render("H=BH  B=planet  V=body  O=pause  ESC=quit",
-                                True, (120,140,180))
-        surface.blit(hint, (px0+4, py0+PH-14))
+                                True,(120,140,180))
+        surface.blit(hint,(px0+4,py0+PH-14))
+
+    # ── HUD ───────────────────────────────────────────────────────────────────
 
     def _hud(self, surface, fps, bh_list, show_particles, selected_bh_idx):
         from config import Config
@@ -365,13 +365,13 @@ class Renderer:
             bh_str,
         ]
         legend = self.font.render(
-            "Units: Mass [M]  Distance [R_s]  Velocity [c]", True, (150,160,180))
-        surface.blit(legend, (10,10))
+            "Units: Mass [M_geo]  Dist [R_s]  Vel [c]  Time [s_sim]", True,(150,160,180))
+        surface.blit(legend,(10,10))
         for i, line in enumerate(lines):
-            s = self.font.render(line, True, (200,220,255))
-            surface.blit(s, (10, self.H - 14*(len(lines)-i)))
+            s = self.font.render(line, True,(200,220,255))
+            surface.blit(s,(10, self.H-14*(len(lines)-i)))
 
-    # Main render
+    # ── main render ───────────────────────────────────────────────────────────
 
     def render(self, surface, camera, disk_list, free, objects,
                bh_list, fps, show_particles=True,
@@ -380,33 +380,34 @@ class Renderer:
         buf = np.zeros((self.W, self.H, 3), dtype=np.int16)
         from config import Config
 
-        #Project all active BHs
         bh_projs = []
         for bh in bh_list:
             if not bh.active: continue
             res = camera.project_single(bh.pos, self.W, self.H)
             if res is None: continue
             bhx, bhy, bh_depth = res
+
             dist_fc    = math.hypot(bhx-self.W/2, bhy-self.H/2)
-            max_r      = max(self.W, self.H)*0.7
-            dist_fade  = np.clip(1.0-(dist_fc-max_r)/max_r, 0.0, 1.0)
+            max_r      = max(self.W,self.H)*0.7
+            dist_fade  = np.clip(1.0-(dist_fc-max_r)/(max_r+1.0), 0.0, 1.0)
             depth_fade = np.clip((bh_depth-0.1)/5.0, 0.0, 1.0)
             fade       = dist_fade * depth_fade
+
             shadow_r_px   = camera.get_screen_radius(
                 bh.shadow_r_sim*bh.SIM_SCALE, bh_depth, self.W, self.H) * fade
             einstein_r_px = camera.get_screen_radius(
                 bh.einstein_r_sim*bh.SIM_SCALE, bh_depth, self.W, self.H) * fade
             bh_projs.append((bhx, bhy, einstein_r_px, bh_depth, shadow_r_px, bh))
 
-        bh_projs.sort(key=lambda x: x[3])#nearest first
+        bh_projs.sort(key=lambda x: x[3])
 
-        #1 - Stars
+        # 1 stars
         self._draw_stars(buf, camera, bh_projs)
 
         if show_particles:
-            #2 - Far-side particles
+            # 2 far particles
             self._draw_particles(buf, camera, disk_list, free, 'far', bh_projs)
-            #3 - Photon rings
+            # 3 photon rings
             if Config.USE_VIRTUAL_ACCRETION_DISK:
                 for bhx, bhy, _te, bh_depth, shadow_r_px, bh in bh_projs:
                     if shadow_r_px <= 0: continue
@@ -415,36 +416,36 @@ class Renderer:
                             self._draw_photon_ring(buf, camera, disk,
                                                    bhx, bhy, bh_depth, shadow_r_px)
 
-        #4 - Commit numpy → surface
+        # 4 flush — nothing black painted
         np.clip(buf, 0, 255, out=buf)
-        px = pygame.surfarray.pixels3d(surface);  px[:] = buf.astype(np.uint8);  del px
+        px = pygame.surfarray.pixels3d(surface); px[:] = buf.astype(np.uint8); del px
 
-        #4b - Far-side celestial bodies
+        # 4b far bodies
         for obj in objects:
             self._draw_celestial_body(surface, camera, obj, bh_projs, 'far')
 
-        #5 - Merger flashes only (NO black circle — shadow is physically created
-        #   by the photon ring + lensing occlusion, not a painted disc)
-        for _bhx, _bhy, _te, _bd, _sr, bh in bh_projs:
+        # 5 merger flashes
+        for _bhx,_bhy,_te,_bd,_sr,bh in bh_projs:
             if bh.merge_flash > 0:
                 self._draw_merger_flash(surface, bh, camera)
 
-        #6 - Near-side particles
+        # 6 near particles
         if show_particles:
             px2  = pygame.surfarray.pixels3d(surface)
-            buf2 = px2.astype(np.int16);  del px2
+            buf2 = px2.astype(np.int16); del px2
             self._draw_particles(buf2, camera, disk_list, free, 'near', bh_projs)
             np.clip(buf2, 0, 255, out=buf2)
-            px3  = pygame.surfarray.pixels3d(surface);  px3[:] = buf2.astype(np.uint8);  del px3
+            px3  = pygame.surfarray.pixels3d(surface)
+            px3[:] = buf2.astype(np.uint8); del px3
 
-        #6b - Near-side celestial bodies
+        # 6b near bodies
         for obj in objects:
             self._draw_celestial_body(surface, camera, obj, bh_projs, 'near')
 
-        #7 - Bloom
+        # 7 bloom
         self._bloom(surface)
 
-        #8 - HUD + config panel
+        # 8 HUD
         self._hud(surface, fps, bh_list, show_particles, selected_bh_idx)
         if panel_state:
             self.draw_config_panel(surface, panel_state)

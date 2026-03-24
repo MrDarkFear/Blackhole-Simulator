@@ -1,4 +1,4 @@
-#config.py — v6
+# config.py — v8
 class Config:
     G_SI = 6.67430e-11
     C_SI = 299792458
@@ -8,30 +8,25 @@ class Config:
     M_BH   = 0.5
     SPIN_A = 0.0
 
-    # Multi-BH scenarios 
     INITIAL_BLACK_HOLES = [
         dict(pos=(0,0,0), vel=(0,0,0), mass=0.5, spin=0.0),
     ]
     RANDOM_BH_COUNT = None
 
-    # Scale 
     SIM_SCALE = 55.0
 
-    # Multi-BH dynamics 
     BH_GRAVITY_ON  = True
     BH_MERGERS_ON  = True
 
-    # Brightness & Counts 
     DISK_BRIGHTNESS             = 1.5
     GLOBAL_BRIGHTNESS           = 1.0
     DISK_PARTICLE_COUNT         = 15000
     STAR_COUNT                  = 3400
 
-    # Visual / mechanics toggles 
     USE_VIRTUAL_ACCRETION_DISK  = True
     PLANET_SPAGHETTIFICATION    = True
     PARTICLE_TEMP_GLOW          = True
-    REALISTIC_STARS             = True   #fix stars in 3D world space
+    REALISTIC_STARS             = True
     PHYSICS_MODE                = "realistic"
     TIME_LAPSE                  = 1.0
     ENABLE_TIME_DILATION_CAMERA   = True
@@ -55,47 +50,62 @@ class Config:
     ACCRETION_DM_PARTICLE = 0.00005
     ACCRETION_DM_BODY     = 0.005
 
+    # inter-particle gravity (weak, realistic pressure-free gas)
+    PARTICLE_FORCE        = False
+    PARTICLE_FORCE_STRENGTH = 0.0008   # G_eff for particle-particle attraction
+
+    # scale particle draw-size by depth (perspective consistent)
+    PARTICLE_AUTO_ZOOM    = True
+    PARTICLE_BASE_SIZE    = 1.0        # reference size at SIM_SCALE distance
+
 
 CONFIG_PANEL_PARAMS = [
     dict(name="Time Lapse",              attr="TIME_LAPSE",
-         type="float", min=0.0, max=30.0, step=0.5),
+         type="float", min=0.0, max=30.0, step=0.5,    unit="×"),
     dict(name="Time Dilation (camera)",  attr="ENABLE_TIME_DILATION_CAMERA",  type="bool"),
     dict(name="Time Dilation (objects)", attr="ENABLE_TIME_DILATION_OBJECTS", type="bool"),
     dict(name="BH Gravity",              attr="BH_GRAVITY_ON",   type="bool"),
     dict(name="BH Mergers",              attr="BH_MERGERS_ON",   type="bool"),
     dict(name="Hawking Evaporation",     attr="ENERGY_LOST",     type="bool"),
     dict(name="Hawking Evap Rate",       attr="HAWKING_EVAPORATION_RATE",
-         type="float", min=0.0, max=0.01, step=0.0001),
+         type="float", min=0.0, max=0.01, step=0.0001, unit="M/s²"),
     dict(name="Physics Mode",            attr="PHYSICS_MODE",
          type="choice", choices=["realistic","2-body"]),
     dict(name="GR Curvature",            attr="GR_CURVATURE_EFFECT",     type="bool"),
     dict(name="Lense-Thirring Spin",     attr="BH_SPIN_LENSE_THIRRING",  type="bool"),
     dict(name="Object Gravity",          attr="OBJECT_GRAVITY",          type="bool"),
     dict(name="Orbit Energy Decay",      attr="ORBIT_ENERGY_DECAY",
-         type="float", min=0.0, max=0.1, step=0.002),
+         type="float", min=0.0, max=0.1, step=0.002,   unit="/s"),
     dict(name="Multi-Body Noise",        attr="MULTI_BODY_NOISE",
-         type="float", min=0.0, max=0.02, step=0.001),
+         type="float", min=0.0, max=0.02, step=0.001,  unit="σ"),
     dict(name="Particle Chaos",          attr="PARTICLE_DYNAMICS_NOISE",
-         type="float", min=0.0, max=0.2, step=0.01),
+         type="float", min=0.0, max=0.2, step=0.01,    unit="σ"),
     dict(name="Global Brightness",       attr="GLOBAL_BRIGHTNESS",
-         type="float", min=0.1, max=4.0, step=0.1),
+         type="float", min=0.1, max=4.0, step=0.1,     unit="×"),
     dict(name="Disk Brightness",         attr="DISK_BRIGHTNESS",
-         type="float", min=0.1, max=5.0, step=0.1),
+         type="float", min=0.1, max=5.0, step=0.1,     unit="×"),
     dict(name="Star Count",              attr="STAR_COUNT",
-         type="int", min=0, max=15000, step=500),
+         type="int", min=0, max=15000, step=500,        unit="★"),
     dict(name="Disk Particle Count",     attr="DISK_PARTICLE_COUNT",
-         type="int", min=0, max=15000, step=500),
+         type="int", min=0, max=15000, step=500,        unit="pts"),
     dict(name="Virtual Accretion Disk",  attr="USE_VIRTUAL_ACCRETION_DISK", type="bool"),
     dict(name="Realistic Stars (3D)",    attr="REALISTIC_STARS",            type="bool"),
-    dict(name="Redshift Fading",         attr="ENABLE_REDSHIFT_FADING",    type="bool"),
-    dict(name="Particle Temp Glow",      attr="PARTICLE_TEMP_GLOW",        type="bool"),
-    dict(name="Spaghettification",       attr="PLANET_SPAGHETTIFICATION",  type="bool"),
+    dict(name="Redshift Fading",         attr="ENABLE_REDSHIFT_FADING",     type="bool"),
+    dict(name="Particle Temp Glow",      attr="PARTICLE_TEMP_GLOW",         type="bool"),
+    dict(name="Spaghettification",       attr="PLANET_SPAGHETTIFICATION",   type="bool"),
     dict(name="Roche Limit Base",        attr="ROCHE_LIMIT_BASE",
-         type="float", min=1.0, max=60.0, step=1.0),
+         type="float", min=1.0, max=60.0, step=1.0,    unit="R_s"),
     dict(name="Planet Cohesion",         attr="PLANET_COHESION",
-         type="float", min=0.05, max=5.0, step=0.05),
+         type="float", min=0.05, max=5.0, step=0.05,   unit="×"),
     dict(name="Gas Emission Rate",       attr="GAS_EMISSION_RATE",
-         type="float", min=0.1, max=10.0, step=0.1),
+         type="float", min=0.1, max=10.0, step=0.1,    unit="×"),
     dict(name="Plunge Factor",           attr="PARTICLE_PLUNGE_FACTOR",
-         type="float", min=0.0, max=2.0, step=0.1),
+         type="float", min=0.0, max=2.0, step=0.1,     unit="×"),
+    # --- new ---
+    dict(name="Particle Force",          attr="PARTICLE_FORCE",             type="bool"),
+    dict(name="Particle Force Strength", attr="PARTICLE_FORCE_STRENGTH",
+         type="float", min=0.0, max=0.01, step=0.0001, unit="G_eff"),
+    dict(name="Particle Auto-Zoom",      attr="PARTICLE_AUTO_ZOOM",         type="bool"),
+    dict(name="Particle Base Size",      attr="PARTICLE_BASE_SIZE",
+         type="float", min=0.1, max=5.0, step=0.1,     unit="px"),
 ]
