@@ -174,6 +174,6 @@ computer.py      — base physics constants, spline math
 config.py        — all tunable parameters + config panel definitions
 ```
 
-# Thank you for using my Project, pls help me improve it by give me some star or advantage to my social-media (In my profile)
+# Thank you for using my Project, pls help me improve it by give me some star or advise to my social-media (In my profile)
 
 # ',:)
